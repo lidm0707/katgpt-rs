@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/katgpt-core", "."]
+members = ["crates/katgpt-core", "crates/latent-calculator", "."]
 resolver = "3"
 
 [package]

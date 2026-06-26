@@ -1,0 +1,18 @@
+[package]
+name = "latent-calculator"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "LatCal — modelless natural-language calculator (no ML weights, pure Rust)"
+
+[features]
+default = []
+# Modelless underspecification routing via katgpt-core's questbench (Plan 245).
+# Opt-in: reuses katgpt-core's normalized-entropy underspecification scorer +
+# QuestBench decision thresholds to route ambiguous inputs to a typed
+# `ParseError::Underspecified` instead of a silent Unknown. Keeps the default
+# build zero-dependency.
+modelless = ["dep:katgpt-core"]
+
+[dependencies]
+katgpt-core = { path = "../katgpt-core", optional = true, default-features = false, features = ["questbench"] }
