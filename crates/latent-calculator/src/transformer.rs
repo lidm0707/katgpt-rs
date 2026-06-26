@@ -67,9 +67,15 @@ enum Slot {
 
 /// Run the analytical transformer on `input` and return the integer result.
 ///
-/// Scope: single-digit operands `0..=9` with `+`, `-`, or `×` (also the words
-/// `plus / minus / times` and the symbols). Returns `None` for anything
-/// outside that vocabulary (multi-digit, division, missing operands).
+/// Scope: single-digit operands `0..=9` with:
+/// - explicit operators: `+ - ×` (symbols or `plus / minus / times`);
+/// - **natural-language operation words** (neuro-symbolic mapping):
+///   `buy/get/gain/receive`→+, `eat/lose/give/take/spend/drop`→−,
+///   `double`→×2, `triple`→×3.
+///
+/// NL words are embedded into the op slot, so the forward pass maps NL →
+/// operation → result. Returns `None` outside that vocabulary (multi-digit,
+/// division, missing operands).
 pub fn evaluate(input: &str) -> Option<f64> {
     let tokens = lex(input);
     let (a, op, b) = parse_seq(&tokens)?;
@@ -165,21 +171,72 @@ fn softmax(logits: &[f64; N_POS]) -> [f64; N_POS] {
     e
 }
 
+/// A natural-language operation word mapped to a transformer op.
+#[derive(Clone, Copy)]
+pub enum NlOp {
+    /// Two-operand: needs both `a` and `b` from the input.
+    Binary(OpIdx),
+    /// One-operand: the second operand is implicit (e.g. `double` ⇒ ×2).
+    Unary(OpIdx, usize),
+}
+
+const NL_ADD: &[&str] = &["buy", "get", "gain", "receive"];
+const NL_SUB: &[&str] = &["eat", "lose", "give", "take", "spend", "drop"];
+
+/// Map a natural-language operation word to a transformer op. Returns `None`
+/// for words that aren't operation vocabulary.
+pub fn nl_word(w: &str) -> Option<NlOp> {
+    if NL_ADD.iter().any(|k| w.eq_ignore_ascii_case(k)) {
+        return Some(NlOp::Binary(OpIdx::Add));
+    }
+    if NL_SUB.iter().any(|k| w.eq_ignore_ascii_case(k)) {
+        return Some(NlOp::Binary(OpIdx::Sub));
+    }
+    if w.eq_ignore_ascii_case("double") {
+        return Some(NlOp::Unary(OpIdx::Mul, 2));
+    }
+    if w.eq_ignore_ascii_case("triple") {
+        return Some(NlOp::Unary(OpIdx::Mul, 3));
+    }
+    None
+}
+
+/// `true` if `w` is a natural-language operation word. Used by the plausibility
+/// gate so NL operation inputs are recognised as math signal.
+pub fn is_nl_op_word(w: &str) -> bool {
+    nl_word(w).is_some()
+}
+
 /// Reduce tokens to `(operand_a, op_idx, operand_b)` for single digits.
+/// Recognises explicit operators AND natural-language operation words;
+/// unary NL words (`double`/`triple`) supply the implicit second operand.
 fn parse_seq(tokens: &[Token<'_>]) -> Option<(usize, OpIdx, usize)> {
     let mut nums: Vec<f64> = Vec::new();
-    let mut op: Option<OpIdx> = None;
+    let mut bin_op: Option<OpIdx> = None;
+    let mut unary: Option<(OpIdx, usize)> = None;
     for t in tokens {
         match t {
             Token::Number(n) | Token::Quantity(n) => nums.push(*n),
-            Token::Op(ArithOp::Add) => op = op.or(Some(OpIdx::Add)),
-            Token::Op(ArithOp::Sub) => op = op.or(Some(OpIdx::Sub)),
-            Token::Op(ArithOp::Mul) | Token::Times => op = op.or(Some(OpIdx::Mul)),
+            Token::Op(ArithOp::Add) => bin_op = bin_op.or(Some(OpIdx::Add)),
+            Token::Op(ArithOp::Sub) => bin_op = bin_op.or(Some(OpIdx::Sub)),
+            Token::Op(ArithOp::Mul) | Token::Times => bin_op = bin_op.or(Some(OpIdx::Mul)),
             Token::Op(ArithOp::Div) => return None,
+            Token::Word(w) => match nl_word(w) {
+                Some(NlOp::Binary(op)) => bin_op = bin_op.or(Some(op)),
+                Some(NlOp::Unary(op, implicit)) => unary = Some((op, implicit)),
+                None => {}
+            },
             _ => {}
         }
     }
-    let op = op?;
+    // Unary NL word (double/triple): one input operand + the implicit one.
+    if let Some((op, implicit)) = unary {
+        if nums.len() == 1 {
+            return Some((as_digit(nums[0])?, op, implicit));
+        }
+        return None;
+    }
+    let op = bin_op?;
     if nums.len() != 2 {
         return None;
     }
@@ -216,6 +273,24 @@ mod tests {
         assert_eq!(evaluate("9 times 9"), Some(81.0));
         assert_eq!(evaluate("6 * 7"), Some(42.0));
         assert_eq!(evaluate("0 * 9"), Some(0.0));
+    }
+
+    #[test]
+    fn nl_binary_words() {
+        // NL operation words map into the op slot (neuro-symbolic).
+        assert_eq!(evaluate("2 buy 1"), Some(3.0));
+        assert_eq!(evaluate("9 get 1"), Some(10.0));
+        assert_eq!(evaluate("5 eat 2"), Some(3.0));
+        assert_eq!(evaluate("8 give 3"), Some(5.0));
+        assert_eq!(evaluate("7 spend 4"), Some(3.0));
+    }
+
+    #[test]
+    fn nl_unary_words() {
+        // double/triple ⇒ implicit second operand (×2 / ×3).
+        assert_eq!(evaluate("double 5"), Some(10.0));
+        assert_eq!(evaluate("triple 3"), Some(9.0));
+        assert_eq!(evaluate("double 9"), Some(18.0)); // result may be multi-digit
     }
 
     #[test]

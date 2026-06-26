@@ -23,6 +23,14 @@ pub enum Computation {
         rate: f64,
         base: f64,
     },
+    /// Percent adjustment on a price: discount (subtract) or tax (add).
+    PercentPrice {
+        price: f64,
+        percent: f64,
+        dir: PercentDir,
+        currency: Option<Currency>,
+        side: CurrencySide,
+    },
     Single {
         value: f64,
         currency: Option<Currency>,
@@ -31,7 +39,19 @@ pub enum Computation {
     Unknown,
 }
 
+/// Direction of a percent-price adjustment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PercentDir {
+    /// `price discount pct%` ⇒ price × (1 − pct/100)
+    Discount,
+    /// `price tax pct%` ⇒ price × (1 + pct/100)
+    Tax,
+}
+
 pub fn resolve(o: &Operands) -> Computation {
+    if let Some(c) = try_percent_price(o) {
+        return c;
+    }
     if let Some(c) = try_percent(o) {
         return c;
     }
@@ -81,6 +101,28 @@ fn try_percent(o: &Operands) -> Option<Computation> {
     Some(Computation::PercentOf {
         rate: o.percents[0],
         base: o.numbers[0],
+    })
+}
+
+/// `price discount/tax pct%` ⇒ final price after the percent adjustment.
+fn try_percent_price(o: &Operands) -> Option<Computation> {
+    if o.percents.is_empty() || o.prices.is_empty() {
+        return None;
+    }
+    let dir = if o.has_discount {
+        PercentDir::Discount
+    } else if o.has_tax {
+        PercentDir::Tax
+    } else {
+        return None;
+    };
+    let (price, cur) = o.prices[0];
+    Some(Computation::PercentPrice {
+        price,
+        percent: o.percents[0],
+        dir,
+        currency: Some(cur),
+        side: o.side,
     })
 }
 

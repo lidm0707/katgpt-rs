@@ -1,9 +1,9 @@
 # Plan 245: Latent Calculator (LatCal) — Modelless Natural-Language Math
 
-**Status:** ✅ Rule-based crate + modelless routing (katgpt-core `questbench`) + mini analytical transformer all done. Percepta transformer-VM path still BLOCKED.
-**Date:** 2026-06-26
-**Crate:** `latent-calculator` (pure Rust; default zero-dep, opt-in `modelless` and `transformer` features)
-**Concept:** "LatCal" — referenced as `LatCalIx` in Plan 244. Modelless = no ML weights, pure rule-based NLU. The `modelless` feature adds QuestBench underspecification routing from `katgpt-core` (Plan 110 / Research 008); the `transformer` feature adds a hand-built analytical transformer (no training) for +, −, × over single digits.
+**Status:** ✅ Zero-dependency, no feature flags. Rule-based engine + always-on plausibility gate + neuro-symbolic analytical transformer with NL operation-word mapping. (katgpt-core/questbench routing was built then removed per user request — crate is now flag-free.)
+**Date:** 2026-06-27
+**Crate:** `latent-calculator` (pure Rust, **zero dependencies, no feature flags**)
+**Concept:** "LatCal" — referenced as `LatCalIx` in Plan 244. Modelless = no ML weights, no training. A neuro-symbolic analytical transformer maps natural-language operation words into hand-set weights.
 
 ## Goal
 
@@ -52,6 +52,10 @@ Preserve currency side from input (`20$` suffix → `60$` suffix).
 - [x] 8. `cargo check && cargo clippy -p latent-calculator` clean
 - [x] 9. **Modelless routing from katgpt-core (Plan 245 pick D):** opt-in `modelless` feature → `katgpt-core/questbench`. New `src/underspec.rs` builds a fixed-vocabulary relevance distribution over the 5 computation kinds from `Operands`, then reuses `katgpt_core::underspecification_score` (normalized entropy) + `QuestBenchDecision` + `tier_from_score`. `Calculator::parse` routes genuinely ambiguous inputs (score > `plan_new_threshold`) to a typed `ParseError::Underspecified { score }`; well-specified inputs compute unchanged. Default crate stays zero-dependency.
 - [x] 10. **Mini analytical transformer (Plan 245 Option C):** opt-in zero-dependency `transformer` feature → new `src/transformer.rs`. A real hand-weighted forward pass (position-aware embed → single-head attention via hand-set Q/K → ReLU FFN truth table → linear readout) computes `+`, `−`, `×` exactly over single-digit operands. Weights are analytic (no training): one ReLU unit per `(op, a, b)` combo, gated at `2.5s`. `evaluate()`/`forward()` + `Calculator::parse_transformer`. 9 → 9 exhaustive check passes within 1e-6.
+- [x] 11. **Fusion feature `transformer_modelless` (Plan 245):** bundles `modelless` + `transformer` and adds `Calculator::parse_fused`. The modelless underspecification router guards the analytical transformer: ambiguous → `ParseError::Underspecified`; well-specified single-digit `+ - ×` → transformer computes; everything else (currency, percent, average, multi-digit) → rule-based engine fallback. 28 tests with `--features transformer_modelless`; clippy clean on the crate.
+- [x] 12. **Always-on plausibility gate (Plan 245):** new zero-dep `src/plausibility.rs` + `ParseError::NotMath`. Rejects inputs that don't look like math (no strong anchor + noise) — e.g. `why 2 dog and die 1` was wrongly answered `sum is 3`. Rule: accept if a strong anchor is present (Op/Times/currency/quantity/percent/`total`/`average`/NL-op-word) OR terse pure-math with no noise.
+- [x] 13. **Neuro-symbolic NL operation mapping + flag-free simplification (Plan 245):** natural-language operation words (`buy/get/gain/receive`→+, `eat/lose/give/take/spend/drop`→−, `double`→×2, `triple`→×3) get embedded into the transformer's op slot — compiled symbolic word-meanings into neural weights (true neuro-symbolic). Per user request (**"no flag feature"**), removed ALL feature flags and the `katgpt-core` dependency: the crate is now zero-dependency with no `[features]` section. Removed `modelless`/`transformer`/`transformer_modelless` features, `underspec.rs`, `ParseError::Underspecified`. `transformer.rs` is always-on; `parse_fused` = transformer-primary + rule-based fallback (no router). 31 tests, clippy clean. REPL uses `parse_fused` so `2 buy 1`→3, `double 5`→10.
+- [x] 14. **Percent-price operations + float-noise formatting (Plan 245):** added `discount`/`off`/`sale`/`save` (price × (1−pct/100)) and `tax`/`tip`/`vat` (price × (1+pct/100)) via new `Computation::PercentPrice` + `PercentDir` enum. `10$ discount 2%` was wrongly echoed as `result is 10$`; now correctly `result is 9.8$`. Also fixed `fmt_num` float noise (snap to 9 decimals) so `50$ tax 10%` → `result is 55$` (not `55.00000000000001$`). 32 tests, clippy clean.
 
 ## Notes
 - Pure std, no external crates (lean, zero-copy).

@@ -1,6 +1,6 @@
 //! Compute a resolved Computation and format the natural-language answer.
 
-use crate::intent::Computation;
+use crate::intent::{Computation, PercentDir};
 use crate::{Currency, CurrencySide};
 
 pub fn compute(c: &Computation) -> Option<(f64, &'static str, Option<Currency>, CurrencySide)> {
@@ -38,6 +38,19 @@ pub fn compute(c: &Computation) -> Option<(f64, &'static str, Option<Currency>, 
         Computation::PercentOf { rate, base } => {
             Some((rate / 100.0 * base, "result", None, CurrencySide::Suffix))
         }
+        Computation::PercentPrice {
+            price,
+            percent,
+            dir,
+            currency,
+            side,
+        } => {
+            let factor = match dir {
+                PercentDir::Discount => 1.0 - percent / 100.0,
+                PercentDir::Tax => 1.0 + percent / 100.0,
+            };
+            Some((price * factor, "result", *currency, *side))
+        }
         Computation::Single {
             value,
             currency,
@@ -67,10 +80,11 @@ fn label_of(op: crate::ArithOp) -> &'static str {
 }
 
 pub fn fmt_num(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
+    // Snap float noise: round to 9 decimals, so 55.00000000000001 → 55.0.
+    let snapped = (v * 1e9).round() / 1e9;
+    if snapped.fract() == 0.0 && snapped.abs() < 1e15 {
+        format!("{}", snapped as i64)
     } else {
-        let s = format!("{v}");
-        s
+        format!("{snapped}")
     }
 }

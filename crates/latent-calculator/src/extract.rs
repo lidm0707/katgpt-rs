@@ -16,6 +16,8 @@ pub struct Operands {
     pub has_avg: bool,
     pub has_total: bool,
     pub has_sum: bool,
+    pub has_discount: bool,
+    pub has_tax: bool,
     pub currency: Option<Currency>,
     pub side: CurrencySide,
 }
@@ -80,6 +82,8 @@ fn classify_word(w: &str, o: &mut Operands) {
         "average" | "avg" | "mean" => o.has_avg = true,
         "total" | "altogether" | "price" | "cost" | "sum" | "add" => o.has_total = true,
         "plus" | "and" => o.has_sum = true,
+        "discount" | "off" | "sale" | "save" => o.has_discount = true,
+        "tax" | "tip" | "vat" => o.has_tax = true,
         _ => {}
     }
 }

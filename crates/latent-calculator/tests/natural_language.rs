@@ -55,3 +55,23 @@ fn percent_of() {
         "result is 10"
     );
 }
+
+#[test]
+fn discount_and_tax() {
+    // `price discount pct%` ⇒ final price after discount.
+    assert_eq!(
+        Calculator::parse("10$ discount 2%").unwrap().to_sentence(),
+        "result is 9.8$"
+    );
+    assert_eq!(
+        Calculator::parse("100$ discount 20%")
+            .unwrap()
+            .to_sentence(),
+        "result is 80$"
+    );
+    // `price tax pct%` ⇒ final price after tax.
+    assert_eq!(
+        Calculator::parse("50$ tax 10%").unwrap().to_sentence(),
+        "result is 55$"
+    );
+}
