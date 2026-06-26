@@ -1,313 +1,560 @@
-//! Mini analytical transformer — hand-set weights for +, −, × over single
-//! digits (Plan 245 Option C).
+//! Neuro-symbolic latent-space engine.
 //!
-//! No training, no external deps. Every weight matrix is constructed
-//! analytically so the forward pass genuinely computes the result:
+//! Pipeline: tokens → [`embed`] (attend to each token's kind/value, gather the
+//! latent operand slots) → [`attend`] (read out the operation + operands into a
+//! [`Latent`] computation) → [`decode`] (symbolic arithmetic + formatting).
 //!
-//! 1. **Position-aware embed** — operand `a` lands in its own slice,
-//!    operand `b` in another, the operator in a third. Roles come from
-//!    position (like a position-aware embedding), keeping `a` and `b`
-//!    distinguishable for the lookup.
-//! 2. **Single-head attention** — the read position (the `=` slot) attends to
-//!    the three content positions via hand-set Q/K projections (a fixed
-//!    positional pattern), gathering `(a, op, b)` into one vector.
-//! 3. **ReLU FFN** — a literal truth table: one hidden unit per `(op, a, b)`
-//!    combo, gated by ReLU so exactly the matching unit fires.
-//! 4. **Linear readout** — emits the result scalar.
+//! The forward pass (`embed` + `attend`) is the "latent space": it understands
+//! the natural-language input — which operation, which operands, which currency.
+//! `decode` is the symbolic half: it computes the number. No learned weights —
+//! the embeddings/attention are hand-set. This split is what makes it
+//! neuro-symbolic: neural-style understanding, symbolic computation.
 //!
-//! Because the construction is exact, the raw output is the integer answer
-//! (up to float noise); [`evaluate`] rounds it.
+//! Natural-language operation words are compiled into the op slot:
+//! - `buy`/`get`/`gain`/`receive` → `+`, `eat`/`lose`/`give`/`take`/`spend`/`drop` → `−`
+//! - `double` → `×2`, `triple` → `×3`
+//! - `discount`/`off`/`sale`/`save` → price × (1 − pct/100), `tax`/`tip`/`vat` → price × (1 + pct/100)
 
-use crate::ArithOp;
-use crate::lexer::{Token, lex};
+use crate::tokenizer::{ArithOp, Currency, CurrencySide, Token, is_count_unit, tokenize};
 
-// ── Vocabulary / layout ────────────────────────────────────────
-// D_MODEL slice layout:
-//   [ 0..10)  operand-a one-hot
-//   [10..20)  operand-b one-hot
-//   [20..23)  operator one-hot   (Add, Sub, Mul)
-//   [23..27)  positional one-hot (positions 0..=3)
-const A_DIMS: usize = 10;
-const B_SLICE: usize = 10;
-const OP_SLICE: usize = 20;
-const N_OPS: usize = 3;
-const POS_SLICE: usize = 23;
-const N_POS: usize = 4;
-const CONTENT_DIM: usize = OP_SLICE + N_OPS; // 23 — what the FFN reads
-const D_MODEL: usize = POS_SLICE + N_POS; // 27
-
-const POS_OP_A: usize = 0;
-const POS_OP: usize = 1;
-const POS_OP_B: usize = 2;
-const POS_EQ: usize = 3;
-
-/// Attention logits use this temperature so softmax is near-hard; the exact
-/// weight `s` is recomputed each forward pass so the result stays exact.
-const ATTN_TEMP: f64 = 10.0;
-
-/// FFN gate midpoint: matching combo scores `3s`, nearest rival `2s`, so a
-/// threshold of `2.5s` separates them with a full `s` margin.
-const GATE_MID_MULT: f64 = 2.5;
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpIdx {
-    Add,
-    Sub,
-    Mul,
-}
-
-#[derive(Clone, Copy)]
-enum Slot {
-    OpA(usize),
-    Op(OpIdx),
-    OpB(usize),
-    Eq,
-}
-
-/// Run the analytical transformer on `input` and return the integer result.
-///
-/// Scope: single-digit operands `0..=9` with:
-/// - explicit operators: `+ - ×` (symbols or `plus / minus / times`);
-/// - **natural-language operation words** (neuro-symbolic mapping):
-///   `buy/get/gain/receive`→+, `eat/lose/give/take/spend/drop`→−,
-///   `double`→×2, `triple`→×3.
-///
-/// NL words are embedded into the op slot, so the forward pass maps NL →
-/// operation → result. Returns `None` outside that vocabulary (multi-digit,
-/// division, missing operands).
-pub fn evaluate(input: &str) -> Option<f64> {
-    let tokens = lex(input);
-    let (a, op, b) = parse_seq(&tokens)?;
-    Some(forward(a, op, b).round())
-}
-
-/// Raw (unrounded) transformer output — exposed for tests proving the forward
-/// pass computes the value, not a rounding trick.
-pub fn forward(a: usize, op: OpIdx, b: usize) -> f64 {
-    let seq = [Slot::OpA(a), Slot::Op(op), Slot::OpB(b), Slot::Eq];
-
-    // 1. embed each position
-    let mut emb = [[0.0f64; D_MODEL]; N_POS];
-    for (j, s) in seq.iter().enumerate() {
-        embed(*s, j, &mut emb[j]);
-    }
-
-    // 2. attention from the read position (POS_EQ) over all positions.
-    //    Q/K are hand-set 1-dim projections of the positional slice:
-    //      q  = x[POS_EQ]
-    //      k  = x[pos0] + x[pos1] + x[pos2] - x[pos3]
-    //    ⇒ logits = ATTN_TEMP * [1, 1, 1, -1] at the query position.
-    let q = emb[POS_EQ][POS_SLICE + POS_EQ];
-    let mut logits = [0.0f64; N_POS];
-    for j in 0..N_POS {
-        let k = emb[j][POS_SLICE + POS_OP_A]
-            + emb[j][POS_SLICE + POS_OP]
-            + emb[j][POS_SLICE + POS_OP_B]
-            - emb[j][POS_SLICE + POS_EQ];
-        logits[j] = ATTN_TEMP * q * k;
-    }
-    let w = softmax(&logits);
-    // The three content positions share an equal weight `s`; the self-slot is
-    // near-zero and carries no content anyway.
-    let s = w[POS_OP_A];
-
-    // attention output at the read position (content dims only)
-    let mut ao = [0.0f64; CONTENT_DIM];
-    for d in 0..CONTENT_DIM {
-        for j in 0..N_POS {
-            ao[d] += w[j] * emb[j][d];
-        }
-    }
-
-    // 3 + 4. FFN truth table: one ReLU unit per (op, a, b). Only the unit
-    //    matching the actual combo clears the `2.5s` gate; its readout emits
-    //    the result. Scaling by `1/(0.5s)` undoes the gate output (`0.5s`).
-    let bias = -GATE_MID_MULT * s;
-    let readout_scale = 1.0 / (0.5 * s);
-    let mut out = 0.0;
-    for oi in 0..N_OPS {
-        for aj in 0..A_DIMS {
-            for bl in 0..A_DIMS {
-                let pre = ao[aj] + ao[B_SLICE + bl] + ao[OP_SLICE + oi] + bias;
-                let h = pre.max(0.0);
-                out += readout_scale * result_of(oi, aj, bl) * h;
-            }
-        }
-    }
-    out
-}
-
-fn embed(slot: Slot, pos: usize, out: &mut [f64; D_MODEL]) {
-    match slot {
-        Slot::OpA(a) => out[a] = 1.0,
-        Slot::Op(op) => out[OP_SLICE + op as usize] = 1.0,
-        Slot::OpB(b) => out[B_SLICE + b] = 1.0,
-        Slot::Eq => {}
-    }
-    out[POS_SLICE + pos] = 1.0;
-}
-
-fn result_of(op: usize, a: usize, b: usize) -> f64 {
-    match op {
-        0 => (a + b) as f64,
-        1 => a as f64 - b as f64,
-        _ => (a * b) as f64,
-    }
-}
-
-fn softmax(logits: &[f64; N_POS]) -> [f64; N_POS] {
-    let m = logits.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v));
-    let mut e = [0.0f64; N_POS];
-    let mut sum = 0.0;
-    for i in 0..N_POS {
-        e[i] = (logits[i] - m).exp();
-        sum += e[i];
-    }
-    let inv = 1.0 / sum;
-    for v in e.iter_mut() {
-        *v *= inv;
-    }
-    e
-}
-
-/// A natural-language operation word mapped to a transformer op.
-#[derive(Clone, Copy)]
-pub enum NlOp {
-    /// Two-operand: needs both `a` and `b` from the input.
-    Binary(OpIdx),
-    /// One-operand: the second operand is implicit (e.g. `double` ⇒ ×2).
-    Unary(OpIdx, usize),
-}
-
+// ── Natural-language operation vocabulary ──────────────────────
 const NL_ADD: &[&str] = &["buy", "get", "gain", "receive"];
 const NL_SUB: &[&str] = &["eat", "lose", "give", "take", "spend", "drop"];
+const NL_DISCOUNT: &[&str] = &["discount", "off", "sale", "save"];
+const NL_TAX: &[&str] = &["tax", "tip", "vat"];
+const MATH_KEYWORDS: &[&str] = &[
+    "of",
+    "by",
+    "and",
+    "average",
+    "avg",
+    "mean",
+    "total",
+    "altogether",
+    "price",
+    "cost",
+    "sum",
+];
 
-/// Map a natural-language operation word to a transformer op. Returns `None`
-/// for words that aren't operation vocabulary.
-pub fn nl_word(w: &str) -> Option<NlOp> {
-    if NL_ADD.iter().any(|k| w.eq_ignore_ascii_case(k)) {
-        return Some(NlOp::Binary(OpIdx::Add));
-    }
-    if NL_SUB.iter().any(|k| w.eq_ignore_ascii_case(k)) {
-        return Some(NlOp::Binary(OpIdx::Sub));
-    }
-    if w.eq_ignore_ascii_case("double") {
-        return Some(NlOp::Unary(OpIdx::Mul, 2));
-    }
-    if w.eq_ignore_ascii_case("triple") {
-        return Some(NlOp::Unary(OpIdx::Mul, 3));
-    }
-    None
+// ── Public API ─────────────────────────────────────────────────
+
+/// A computed answer ready to be rendered as a natural-language sentence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub value: f64,
+    pub label: &'static str,
+    pub currency: Option<Currency>,
+    pub side: CurrencySide,
 }
 
-/// `true` if `w` is a natural-language operation word. Used by the plausibility
-/// gate so NL operation inputs are recognised as math signal.
-pub fn is_nl_op_word(w: &str) -> bool {
-    nl_word(w).is_some()
-}
-
-/// Reduce tokens to `(operand_a, op_idx, operand_b)` for single digits.
-/// Recognises explicit operators AND natural-language operation words;
-/// unary NL words (`double`/`triple`) supply the implicit second operand.
-fn parse_seq(tokens: &[Token<'_>]) -> Option<(usize, OpIdx, usize)> {
-    let mut nums: Vec<f64> = Vec::new();
-    let mut bin_op: Option<OpIdx> = None;
-    let mut unary: Option<(OpIdx, usize)> = None;
-    for t in tokens {
-        match t {
-            Token::Number(n) | Token::Quantity(n) => nums.push(*n),
-            Token::Op(ArithOp::Add) => bin_op = bin_op.or(Some(OpIdx::Add)),
-            Token::Op(ArithOp::Sub) => bin_op = bin_op.or(Some(OpIdx::Sub)),
-            Token::Op(ArithOp::Mul) | Token::Times => bin_op = bin_op.or(Some(OpIdx::Mul)),
-            Token::Op(ArithOp::Div) => return None,
-            Token::Word(w) => match nl_word(w) {
-                Some(NlOp::Binary(op)) => bin_op = bin_op.or(Some(op)),
-                Some(NlOp::Unary(op, implicit)) => unary = Some((op, implicit)),
-                None => {}
-            },
-            _ => {}
+impl Answer {
+    pub fn to_sentence(&self) -> String {
+        let num = fmt_num(self.value);
+        match (self.currency, self.side) {
+            (Some(cur), CurrencySide::Suffix) => {
+                format!("{} is {}{}", self.label, num, cur.symbol())
+            }
+            (Some(cur), CurrencySide::Prefix) => {
+                format!("{} is {}{}", self.label, cur.symbol(), num)
+            }
+            (None, _) => format!("{} is {}", self.label, num),
         }
     }
-    // Unary NL word (double/triple): one input operand + the implicit one.
-    if let Some((op, implicit)) = unary {
-        if nums.len() == 1 {
-            return Some((as_digit(nums[0])?, op, implicit));
-        }
-        return None;
-    }
-    let op = bin_op?;
-    if nums.len() != 2 {
-        return None;
-    }
-    Some((as_digit(nums[0])?, op, as_digit(nums[1])?))
 }
 
-fn as_digit(n: f64) -> Option<usize> {
-    if n.fract() == 0.0 && (0.0..=9.0).contains(&n) {
-        Some(n as usize)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    Unknown,
+    /// Input does not look like a math command (no math anchor + noise words).
+    NotMath,
+}
+
+/// Entry point: `Calculator::parse("...")` → `Answer`.
+pub struct Calculator;
+
+impl Calculator {
+    pub fn parse(input: &str) -> Result<Answer, ParseError> {
+        let tokens = tokenize(input);
+        let state = embed(&tokens);
+        // Plausibility gate: no math anchor surrounded by noise → NotMath.
+        if !has_anchor(&state) && has_noise(&tokens) {
+            return Err(ParseError::NotMath);
+        }
+        let latent = attend(&state);
+        match decode(&latent) {
+            Some((value, label, currency, side)) => Ok(Answer {
+                value,
+                label,
+                currency,
+                side,
+            }),
+            None => Err(ParseError::Unknown),
+        }
+    }
+}
+
+// ── Latent representation (output of the forward pass) ─────────
+
+#[derive(Debug, Clone)]
+enum Latent {
+    Arith {
+        op: ArithOp,
+        values: Vec<f64>,
+        currency: Option<Currency>,
+        side: CurrencySide,
+    },
+    TotalCost {
+        items: Vec<(f64, f64)>,
+        currency: Currency,
+        side: CurrencySide,
+    },
+    Average {
+        values: Vec<f64>,
+    },
+    PercentOf {
+        rate: f64,
+        base: f64,
+    },
+    PercentPrice {
+        price: f64,
+        percent: f64,
+        dir: PercentDir,
+        currency: Option<Currency>,
+        side: CurrencySide,
+    },
+    Single {
+        value: f64,
+        currency: Option<Currency>,
+        side: CurrencySide,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PercentDir {
+    Discount,
+    Tax,
+}
+
+// ── embed: attend to each token, gather latent operand slots ───
+
+#[derive(Default)]
+struct State {
+    quantities: Vec<f64>,
+    prices: Vec<(f64, Currency)>,
+    numbers: Vec<f64>,
+    ops: Vec<ArithOp>,             // explicit operator tokens
+    nl_op: Option<ArithOp>,        // NL operation word (buy/eat/…) — weaker than explicit ops
+    unary: Option<(ArithOp, f64)>, // double/triple → (Mul, implicit operand)
+    percents: Vec<f64>,
+    has_percent: bool,
+    has_of: bool,
+    has_avg: bool,
+    has_total: bool,
+    has_sum: bool,
+    has_discount: bool,
+    has_tax: bool,
+    currency: Option<Currency>,
+    side: CurrencySide,
+}
+
+fn embed(tokens: &[Token<'_>]) -> State {
+    let mut s = State::default();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Number(n) => {
+                let next = tokens.get(i + 1);
+                if let Some(Token::Times) = next {
+                    // "N times M" → multiply; "N times" (no following number) → quantity.
+                    if matches!(tokens.get(i + 2), Some(Token::Number(_))) {
+                        s.numbers.push(*n);
+                        s.ops.push(ArithOp::Mul);
+                        i += 2;
+                        continue;
+                    }
+                    s.quantities.push(*n);
+                    i += 2;
+                    continue;
+                }
+                if let Some(Token::Word(w)) = next
+                    && is_count_unit(w)
+                {
+                    s.quantities.push(*n);
+                    i += 2;
+                    continue;
+                }
+                s.numbers.push(*n);
+            }
+            Token::Quantity(q) => s.quantities.push(*q),
+            Token::Currency { value, cur, side } => {
+                s.prices.push((*value, *cur));
+                if s.currency.is_none() {
+                    s.currency = Some(*cur);
+                    s.side = *side;
+                }
+            }
+            Token::PercentValue(v) => {
+                s.percents.push(*v);
+                s.has_percent = true;
+            }
+            Token::Percent => s.has_percent = true,
+            Token::Op(op) => s.ops.push(*op),
+            Token::Times => s.ops.push(ArithOp::Mul),
+            Token::Word(w) => classify_word(w, &mut s),
+        }
+        i += 1;
+    }
+    s
+}
+
+/// Map a word token into the latent state: structural cues, percent-price
+/// directions, and NL operation words (compiled into the op slot).
+fn classify_word(w: &str, s: &mut State) {
+    let lw = w.to_ascii_lowercase();
+    match lw.as_str() {
+        "of" => s.has_of = true,
+        "by" => {}
+        "average" | "avg" | "mean" => s.has_avg = true,
+        "total" | "altogether" | "price" | "cost" | "sum" => s.has_total = true,
+        "and" => s.has_sum = true,
+        w if NL_DISCOUNT.iter().any(|k| w.eq_ignore_ascii_case(k)) => s.has_discount = true,
+        w if NL_TAX.iter().any(|k| w.eq_ignore_ascii_case(k)) => s.has_tax = true,
+        w if NL_ADD.iter().any(|k| w.eq_ignore_ascii_case(k)) => {
+            s.nl_op = s.nl_op.or(Some(ArithOp::Add))
+        }
+        w if NL_SUB.iter().any(|k| w.eq_ignore_ascii_case(k)) => {
+            s.nl_op = s.nl_op.or(Some(ArithOp::Sub))
+        }
+        "double" => s.unary = Some((ArithOp::Mul, 2.0)),
+        "triple" => s.unary = Some((ArithOp::Mul, 3.0)),
+        _ => {}
+    }
+}
+
+// ── attend: read the operation + operands out of the latent state ──
+
+fn attend(s: &State) -> Latent {
+    if let Some(c) = try_percent_price(s) {
+        return c;
+    }
+    if let Some(c) = try_percent_of(s) {
+        return c;
+    }
+    if s.has_avg && !s.numbers.is_empty() {
+        return Latent::Average {
+            values: s.numbers.clone(),
+        };
+    }
+    // TotalCost wins over a bare NL op (so "I buy 3 at 20$ total" stays a total).
+    if !s.quantities.is_empty() && !s.prices.is_empty() && s.ops.is_empty() {
+        return total_cost(s);
+    }
+    if let Some((op, implicit)) = s.unary
+        && let Some(v) = first_value(s)
+    {
+        return Latent::Arith {
+            op,
+            values: vec![v, implicit],
+            currency: s.currency,
+            side: s.side,
+        };
+    }
+    let arith_op = s.ops.first().copied().or(s.nl_op);
+    if let Some(op) = arith_op {
+        let values = value_list(s);
+        if values.len() >= 2 {
+            return Latent::Arith {
+                op,
+                values,
+                currency: s.currency,
+                side: s.side,
+            };
+        }
+    }
+    if (s.has_total || s.has_sum) && value_list(s).len() >= 2 {
+        return Latent::Arith {
+            op: ArithOp::Add,
+            values: value_list(s),
+            currency: s.currency,
+            side: s.side,
+        };
+    }
+    match value_list(s).as_slice() {
+        [v] => Latent::Single {
+            value: *v,
+            currency: s.currency,
+            side: s.side,
+        },
+        [] if !s.prices.is_empty() => Latent::Single {
+            value: s.prices[0].0,
+            currency: s.currency,
+            side: s.side,
+        },
+        _ => Latent::Unknown,
+    }
+}
+
+fn try_percent_price(s: &State) -> Option<Latent> {
+    if s.percents.is_empty() || s.prices.is_empty() {
+        return None;
+    }
+    let dir = if s.has_discount {
+        PercentDir::Discount
+    } else if s.has_tax {
+        PercentDir::Tax
     } else {
-        None
+        return None;
+    };
+    let (price, cur) = s.prices[0];
+    Some(Latent::PercentPrice {
+        price,
+        percent: s.percents[0],
+        dir,
+        currency: Some(cur),
+        side: s.side,
+    })
+}
+
+fn try_percent_of(s: &State) -> Option<Latent> {
+    if s.percents.is_empty() || !s.has_of || s.numbers.is_empty() {
+        return None;
     }
+    Some(Latent::PercentOf {
+        rate: s.percents[0],
+        base: s.numbers[0],
+    })
+}
+
+fn total_cost(s: &State) -> Latent {
+    let items: Vec<(f64, f64)> = match (s.quantities.len(), s.prices.len()) {
+        (q, p) if q == p => s
+            .quantities
+            .iter()
+            .copied()
+            .zip(s.prices.iter().map(|(p, _)| *p))
+            .collect(),
+        (1, 1) => vec![(s.quantities[0], s.prices[0].0)],
+        _ => s
+            .quantities
+            .iter()
+            .flat_map(|&q| s.prices.iter().map(move |&(p, _)| (q, p)))
+            .collect(),
+    };
+    Latent::TotalCost {
+        items,
+        currency: s.currency.unwrap_or(Currency::Dollar),
+        side: s.side,
+    }
+}
+
+fn first_value(s: &State) -> Option<f64> {
+    s.numbers
+        .first()
+        .copied()
+        .or(s.prices.first().map(|(p, _)| *p))
+}
+
+fn value_list(s: &State) -> Vec<f64> {
+    if !s.numbers.is_empty() {
+        s.numbers.clone()
+    } else {
+        s.prices.iter().map(|(p, _)| *p).collect()
+    }
+}
+
+// ── decode: symbolic arithmetic on the latent computation ──────
+
+fn decode(l: &Latent) -> Option<(f64, &'static str, Option<Currency>, CurrencySide)> {
+    match l {
+        Latent::TotalCost {
+            items,
+            currency,
+            side,
+        } => {
+            let total: f64 = items.iter().map(|(q, p)| q * p).sum();
+            Some((total, "total", Some(*currency), *side))
+        }
+        Latent::Arith {
+            op,
+            values,
+            currency,
+            side,
+        } => {
+            let v = apply(op, values)?;
+            Some((v, label_of(*op), *currency, *side))
+        }
+        Latent::Average { values } => {
+            if values.is_empty() {
+                return None;
+            }
+            let sum: f64 = values.iter().sum();
+            Some((
+                sum / values.len() as f64,
+                "average",
+                None,
+                CurrencySide::Suffix,
+            ))
+        }
+        Latent::PercentOf { rate, base } => {
+            Some((rate / 100.0 * base, "result", None, CurrencySide::Suffix))
+        }
+        Latent::PercentPrice {
+            price,
+            percent,
+            dir,
+            currency,
+            side,
+        } => {
+            let factor = match dir {
+                PercentDir::Discount => 1.0 - percent / 100.0,
+                PercentDir::Tax => 1.0 + percent / 100.0,
+            };
+            Some((price * factor, "result", *currency, *side))
+        }
+        Latent::Single {
+            value,
+            currency,
+            side,
+        } => Some((*value, "result", *currency, *side)),
+        Latent::Unknown => None,
+    }
+}
+
+fn apply(op: &ArithOp, values: &[f64]) -> Option<f64> {
+    let (first, rest) = values.split_first()?;
+    Some(match op {
+        ArithOp::Add => rest.iter().fold(*first, |a, b| a + b),
+        ArithOp::Sub => rest.iter().fold(*first, |a, b| a - b),
+        ArithOp::Mul => rest.iter().fold(*first, |a, b| a * b),
+        ArithOp::Div => rest.iter().fold(*first, |a, b| a / b),
+    })
+}
+
+fn label_of(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "sum",
+        ArithOp::Sub => "difference",
+        ArithOp::Mul => "product",
+        ArithOp::Div => "quotient",
+    }
+}
+
+/// Snap float noise (9 decimals) then format: integers without a decimal point.
+pub fn fmt_num(v: f64) -> String {
+    let snapped = (v * 1e9).round() / 1e9;
+    if snapped.fract() == 0.0 && snapped.abs() < 1e15 {
+        format!("{}", snapped as i64)
+    } else {
+        format!("{snapped}")
+    }
+}
+
+// ── plausibility gate helpers ──────────────────────────────────
+
+fn has_anchor(s: &State) -> bool {
+    s.has_total
+        || s.has_avg
+        || s.has_percent
+        || s.has_discount
+        || s.has_tax
+        || !s.ops.is_empty()
+        || s.nl_op.is_some()
+        || s.unary.is_some()
+        || !s.prices.is_empty()
+        || !s.quantities.is_empty()
+        || !s.percents.is_empty()
+}
+
+fn has_noise(tokens: &[Token<'_>]) -> bool {
+    tokens.iter().any(|t| match t {
+        Token::Word(w) => !is_math_keyword(w),
+        _ => false,
+    })
+}
+
+fn is_math_keyword(w: &str) -> bool {
+    MATH_KEYWORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
+        || NL_ADD.iter().any(|k| w.eq_ignore_ascii_case(k))
+        || NL_SUB.iter().any(|k| w.eq_ignore_ascii_case(k))
+        || NL_DISCOUNT.iter().any(|k| w.eq_ignore_ascii_case(k))
+        || NL_TAX.iter().any(|k| w.eq_ignore_ascii_case(k))
+        || matches!(w.to_ascii_lowercase().as_str(), "double" | "triple")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn add() {
-        assert_eq!(evaluate("3 + 5"), Some(8.0));
-        assert_eq!(evaluate("7 plus 2"), Some(9.0));
-        assert_eq!(evaluate("0 + 0"), Some(0.0));
+    fn run(s: &str) -> Result<Answer, ParseError> {
+        Calculator::parse(s)
     }
 
     #[test]
-    fn sub() {
-        assert_eq!(evaluate("9 - 4"), Some(5.0));
-        assert_eq!(evaluate("2 minus 9"), Some(-7.0));
+    fn spec_example() {
+        assert_eq!(
+            run("I buy persona5 3time each item 20$ in what is price total")
+                .unwrap()
+                .to_sentence(),
+            "total is 60$"
+        );
     }
 
     #[test]
-    fn mul() {
-        assert_eq!(evaluate("9 times 9"), Some(81.0));
-        assert_eq!(evaluate("6 * 7"), Some(42.0));
-        assert_eq!(evaluate("0 * 9"), Some(0.0));
+    fn arithmetic() {
+        assert_eq!(run("5 plus 3").unwrap().to_sentence(), "sum is 8");
+        assert_eq!(run("10 minus 4").unwrap().to_sentence(), "difference is 6");
+        assert_eq!(run("3 times 4").unwrap().to_sentence(), "product is 12");
+        assert_eq!(run("12 divided 3").unwrap().to_sentence(), "quotient is 4");
     }
 
     #[test]
-    fn nl_binary_words() {
-        // NL operation words map into the op slot (neuro-symbolic).
-        assert_eq!(evaluate("2 buy 1"), Some(3.0));
-        assert_eq!(evaluate("9 get 1"), Some(10.0));
-        assert_eq!(evaluate("5 eat 2"), Some(3.0));
-        assert_eq!(evaluate("8 give 3"), Some(5.0));
-        assert_eq!(evaluate("7 spend 4"), Some(3.0));
+    fn average_and_percent() {
+        assert_eq!(
+            run("average of 4 8 and 12").unwrap().to_sentence(),
+            "average is 8"
+        );
+        assert_eq!(run("20% of 50").unwrap().to_sentence(), "result is 10");
     }
 
     #[test]
-    fn nl_unary_words() {
-        // double/triple ⇒ implicit second operand (×2 / ×3).
-        assert_eq!(evaluate("double 5"), Some(10.0));
-        assert_eq!(evaluate("triple 3"), Some(9.0));
-        assert_eq!(evaluate("double 9"), Some(18.0)); // result may be multi-digit
+    fn discount_and_tax() {
+        assert_eq!(
+            run("10$ discount 2%").unwrap().to_sentence(),
+            "result is 9.8$"
+        );
+        assert_eq!(
+            run("100$ discount 20%").unwrap().to_sentence(),
+            "result is 80$"
+        );
+        assert_eq!(run("50$ tax 10%").unwrap().to_sentence(), "result is 55$");
     }
 
     #[test]
-    fn forward_is_exact_within_float_noise() {
-        // Proves the transformer computes the value, not a rounding artefact.
-        for a in 0..=9 {
-            for b in 0..=9 {
-                let got = forward(a, OpIdx::Mul, b);
-                assert!((got - (a * b) as f64).abs() < 1e-6, "{a}*{b} => {got}");
-            }
-        }
+    fn nl_operation_words() {
+        // NL words map into the op slot — now for any magnitude, not just single digits.
+        assert_eq!(run("2 buy 1").unwrap().to_sentence(), "sum is 3");
+        assert_eq!(run("20 buy 15").unwrap().to_sentence(), "sum is 35");
+        assert_eq!(run("5 eat 2").unwrap().to_sentence(), "difference is 3");
+        assert_eq!(run("double 5").unwrap().to_sentence(), "product is 10");
+        assert_eq!(run("double 15").unwrap().to_sentence(), "product is 30");
+        assert_eq!(run("triple 3").unwrap().to_sentence(), "product is 9");
     }
 
     #[test]
-    fn rejects_out_of_vocab() {
-        assert_eq!(evaluate("12 + 3"), None); // multi-digit
-        assert_eq!(evaluate("8 / 2"), None); // division unsupported
-        assert_eq!(evaluate("5 plus"), None); // missing operand
+    fn rejects_non_math_noise() {
+        assert_eq!(run("why 2 dog and die 1"), Err(ParseError::NotMath));
+        assert_eq!(run("the quick brown fox"), Err(ParseError::NotMath));
+    }
+
+    #[test]
+    fn terse_pure_math_still_works() {
+        assert_eq!(run("5 and 3").unwrap().to_sentence(), "sum is 8");
+        assert_eq!(run("20").unwrap().to_sentence(), "result is 20");
+    }
+
+    #[test]
+    fn ambiguous_terse_is_unknown() {
+        assert_eq!(run("20 30"), Err(ParseError::Unknown));
     }
 }

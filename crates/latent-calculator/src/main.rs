@@ -28,7 +28,7 @@ fn main() {
         if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
             break;
         }
-        match Calculator::parse_fused(trimmed) {
+        match Calculator::parse(trimmed) {
             Ok(answer) => {
                 let _ = writeln!(out, "{}", answer.to_sentence());
             }

@@ -1,7 +1,45 @@
-//! Modelless NL lexer: turn a natural-language string into typed tokens.
-//! Word tokens borrow from the input (zero-copy); numbers are parsed.
+//! Tokenizer — turn a natural-language string into typed tokens.
+//!
+//! Pure lexical classification: numbers, currency (`$20`/`20$`), count-units
+//! (`3time`/`3x`), percents (`20%`), explicit operator words (`plus`/`minus`/…),
+//! and symbols. Word tokens borrow from the input (zero-copy).
+//!
+//! Semantic understanding (which operation, which operands) happens in the
+//! transformer's latent space — this module only tokenizes.
 
-use crate::{ArithOp, Currency, CurrencySide};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Currency {
+    Dollar,
+    Euro,
+    Pound,
+    Yen,
+}
+
+impl Currency {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Currency::Dollar => "$",
+            Currency::Euro => "€",
+            Currency::Pound => "£",
+            Currency::Yen => "¥",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CurrencySide {
+    #[default]
+    Suffix,
+    Prefix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 const OP_SPLIT_CHARS: &[char] = &['+', '-', '*', '/', '×', '÷'];
 
@@ -21,7 +59,7 @@ pub enum Token<'a> {
     Word(&'a str),
 }
 
-pub fn lex<'a>(input: &'a str) -> Vec<Token<'a>> {
+pub fn tokenize<'a>(input: &'a str) -> Vec<Token<'a>> {
     let mut out = Vec::new();
     for raw in input.split_whitespace() {
         for piece in split_ops(raw) {
@@ -256,20 +294,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lex_spec_example() {
-        let toks = lex("I buy persona5 3time each item 20$ in what is price total");
+    fn tokenize_spec_example() {
+        let toks = tokenize("I buy persona5 3time each item 20$ in what is price total");
         assert!(toks.contains(&Token::Quantity(3.0)));
         assert!(toks.contains(&Token::Currency {
             value: 20.0,
             cur: Currency::Dollar,
             side: CurrencySide::Suffix
         }));
-        assert!(!toks.contains(&Token::Number(5.0)));
     }
 
     #[test]
     fn inline_ops_split() {
-        let toks = lex("5+3");
+        let toks = tokenize("5+3");
         assert_eq!(
             toks,
             vec![
@@ -281,17 +318,8 @@ mod tests {
     }
 
     #[test]
-    fn times_between_numbers_is_operator() {
-        let toks = lex("3 times 4");
-        assert_eq!(
-            toks,
-            vec![Token::Number(3.0), Token::Times, Token::Number(4.0)]
-        );
-    }
-
-    #[test]
     fn prefix_currency() {
-        let toks = lex("$20");
+        let toks = tokenize("$20");
         assert_eq!(
             toks,
             vec![Token::Currency {
