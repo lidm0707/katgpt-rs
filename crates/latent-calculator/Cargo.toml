@@ -13,6 +13,10 @@ default = []
 # `ParseError::Underspecified` instead of a silent Unknown. Keeps the default
 # build zero-dependency.
 modelless = ["dep:katgpt-core"]
+# Mini analytical transformer (Plan 245 Option C): hand-set weights for +,-,x
+# over single digits. Zero-dependency — a real embed->attention->FFN forward
+# pass with weights chosen analytically (no training).
+transformer = []
 
 [dependencies]
 katgpt-core = { path = "../katgpt-core", optional = true, default-features = false, features = ["questbench"] }

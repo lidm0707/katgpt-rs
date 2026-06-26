@@ -1,9 +1,9 @@
 # Plan 245: Latent Calculator (LatCal) — Modelless Natural-Language Math
 
-**Status:** ✅ Modelless rule-based crate done + modelless routing wired (katgpt-core `questbench`); transformer-VM path still BLOCKED.
+**Status:** ✅ Rule-based crate + modelless routing (katgpt-core `questbench`) + mini analytical transformer all done. Percepta transformer-VM path still BLOCKED.
 **Date:** 2026-06-26
-**Crate:** `latent-calculator` (pure Rust; default zero-dep, opt-in `modelless` feature pulls `katgpt-core/questbench`)
-**Concept:** "LatCal" — referenced as `LatCalIx` in Plan 244. Modelless = no ML weights, pure rule-based NLU. The `modelless` feature adds QuestBench underspecification routing from `katgpt-core` (Plan 110 / Research 008).
+**Crate:** `latent-calculator` (pure Rust; default zero-dep, opt-in `modelless` and `transformer` features)
+**Concept:** "LatCal" — referenced as `LatCalIx` in Plan 244. Modelless = no ML weights, pure rule-based NLU. The `modelless` feature adds QuestBench underspecification routing from `katgpt-core` (Plan 110 / Research 008); the `transformer` feature adds a hand-built analytical transformer (no training) for +, −, × over single digits.
 
 ## Goal
 
@@ -51,6 +51,7 @@ Preserve currency side from input (`20$` suffix → `60$` suffix).
 - [x] 7. Integration test: user's spec example → `total is 60$`
 - [x] 8. `cargo check && cargo clippy -p latent-calculator` clean
 - [x] 9. **Modelless routing from katgpt-core (Plan 245 pick D):** opt-in `modelless` feature → `katgpt-core/questbench`. New `src/underspec.rs` builds a fixed-vocabulary relevance distribution over the 5 computation kinds from `Operands`, then reuses `katgpt_core::underspecification_score` (normalized entropy) + `QuestBenchDecision` + `tier_from_score`. `Calculator::parse` routes genuinely ambiguous inputs (score > `plan_new_threshold`) to a typed `ParseError::Underspecified { score }`; well-specified inputs compute unchanged. Default crate stays zero-dependency.
+- [x] 10. **Mini analytical transformer (Plan 245 Option C):** opt-in zero-dependency `transformer` feature → new `src/transformer.rs`. A real hand-weighted forward pass (position-aware embed → single-head attention via hand-set Q/K → ReLU FFN truth table → linear readout) computes `+`, `−`, `×` exactly over single-digit operands. Weights are analytic (no training): one ReLU unit per `(op, a, b)` combo, gated at `2.5s`. `evaluate()`/`forward()` + `Calculator::parse_transformer`. 9 → 9 exhaustive check passes within 1e-6.
 
 ## Notes
 - Pure std, no external crates (lean, zero-copy).
@@ -89,7 +90,7 @@ weights, zero training). Findings (verified in this checkout):
 - **B) Keep modelless rule-based crate** (DONE, `cargo test` green): genuinely
   modelless (no neural model), computes `3×20=60` from NL today.
 - **C) Tiny custom analytically-built transformer** in the new crate (own weights
-  by hand for +,-,× over a digit vocabulary) — no percepta, no katgpt-rs dep.
+  by hand for +,-,× over a digit vocabulary) — no percepta, no katgpt-rs dep. ✅ DONE (2026-06-26): `src/transformer.rs`, opt-in `transformer` feature. Real forward pass (embed → attention → ReLU FFN → readout), all weights analytic. Computes +, −, × exactly for single-digit operands; exhaustive 10×10 check within 1e-6. `evaluate` / `forward` / `Calculator::parse_transformer`.
 - **D) Use modelless infra from `katgpt-core`** ✅ DONE (2026-06-26): wire the
   `questbench` underspecification scorer into the calculator. `katgpt-core` is
   not a transformer, but its `questbench` module IS a real modelless component

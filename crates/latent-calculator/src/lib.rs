@@ -8,6 +8,8 @@ pub mod engine;
 pub mod extract;
 pub mod intent;
 pub mod lexer;
+#[cfg(feature = "transformer")]
+pub mod transformer;
 #[cfg(feature = "modelless")]
 pub mod underspec;
 
@@ -117,6 +119,19 @@ impl Calculator {
         let tokens = lexer::lex(input);
         let operands = extract::extract(&tokens);
         underspec::score(&operands)
+    }
+
+    /// Compute via the mini analytical transformer (Plan 245 Option C).
+    /// Hand-set weights do `+`, `-`, `×` over single-digit operands.
+    /// Returns `None` outside that vocabulary.
+    #[cfg(feature = "transformer")]
+    pub fn parse_transformer(input: &str) -> Option<Answer> {
+        transformer::evaluate(input).map(|v| Answer {
+            value: v,
+            label: "result",
+            currency: None,
+            side: CurrencySide::Suffix,
+        })
     }
 }
 
